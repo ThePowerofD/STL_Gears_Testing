@@ -37,23 +37,31 @@ DXF_DEFAULT_PARAMETERS: dict[str, int | float] = {
     "Module": 2,
     "Pressure Angle": 20,
     "Number of Teeth": 20,
-    "Profile Shift": 0,
     # Radial Thickness: the ring wall surrounding the Internal Gear's teeth.
     # A laser-cut internal gear has no Gear Length, so thickness is the only
     # depth-analog parameter.
     "Radial Thickness": 10,
-    # Rack dimensions (width and height describe the 2D cross-section)
     "Rack Height": 20,
-    "Rack Width": 10,
 }
 
-# Maps each gear type to exactly the fields it exposes.
-# Keeping this lookup here (not inside methods) makes it easy to update when
-# the site adds or removes fields after the refactor.
+# Maps each gear type to exactly the fields it exposes on the live DXF page.
+# Confirmed against the rendered DOM (probe_form.py) — Profile Shift and
+# Rack Width do NOT exist on /generators/lasercut, so they were removed.
 _GEAR_FIELDS: dict[str, list[str]] = {
-    "Spur Gear": ["Module", "Pressure Angle", "Number of Teeth", "Profile Shift"],
+    "Spur Gear":     ["Module", "Pressure Angle", "Number of Teeth"],
     "Internal Gear": ["Module", "Pressure Angle", "Number of Teeth", "Radial Thickness"],
-    "Rack": ["Module", "Pressure Angle", "Number of Teeth", "Rack Height", "Rack Width"],
+    "Rack":          ["Module", "Pressure Angle", "Number of Teeth", "Rack Height"],
+}
+
+# Friendly label -> real HTML name= attribute on the DXF generator. The page
+# does not use accessible <label for="…"> markup, so we identify inputs by
+# their `name` and pick the visible one (each gear renders its own section).
+_DXF_FIELD_NAMES: dict[str, str] = {
+    "Module":           "modulo",
+    "Pressure Angle":   "ap",
+    "Number of Teeth":  "z",
+    "Radial Thickness": "rt",
+    "Rack Height":      "H",
 }
 
 
@@ -66,10 +74,14 @@ class DxfGeneratorPage(BasePage):
     # "Download Rack" depending on gear type.  We match on "Download" broadly
     # and restrict to interactive elements so we don't accidentally match a
     # heading that happens to contain the word.
+    # The DXF page renders both a <button> and an <a> with "Download DXF"
+    # text — only one is actually clickable at a time. click_visible() picks
+    # the one currently displayed, sidestepping element_to_be_clickable's
+    # tendency to fixate on a hidden first match.
     DOWNLOAD_BUTTON = (
         By.XPATH,
-        "//*[contains(normalize-space(), 'Download')]"
-        "[self::button or self::a or self::input[@type='button' or @type='submit']]",
+        "//*[self::button or self::a or self::input[@type='button' or @type='submit']]"
+        "[contains(normalize-space(), 'Download')]",
     )
 
     # Same XPath strategy as GeneratorPage.START_BUTTON_FOR:
@@ -84,18 +96,14 @@ class DxfGeneratorPage(BasePage):
     )
 
     @staticmethod
-    def _input_near_label(label: str):
-        """XPath: the first non-hidden <input> after the element whose text
-        contains `label`.  Same pattern as GeneratorPage — explained once here
-        so it does not need repeating: the approach is text-proximity rather
-        than an explicit <label for="…"> association because the page may not
-        use accessible label markup consistently.
-        """
-        return (
-            By.XPATH,
-            f"(//*[contains(normalize-space(), '{label}')]"
-            f"/following::input[not(@type='hidden')])[1]",
-        )
+    def _name_for(label: str) -> str:
+        try:
+            return _DXF_FIELD_NAMES[label]
+        except KeyError as exc:
+            raise KeyError(
+                f"No name= mapping for parameter {label!r}. "
+                f"Add it to _DXF_FIELD_NAMES in pages/dxf_generator_page.py."
+            ) from exc
 
     # ----- Navigation -----
 
@@ -134,35 +142,30 @@ class DxfGeneratorPage(BasePage):
         self.click(self.START_BUTTON_FOR(gear_name))
 
     def set_parameter(self, label: str, value: int | float) -> None:
-        """Type a numeric value into the field whose label text contains `label`."""
-        self.set_number_input(self._input_near_label(label), value)
+        """Set the field labeled `label` to `value`, scoped to the visible form."""
+        self.set_input_by_name(self._name_for(label), value)
 
     def fill_default_parameters(self, gear_name: str) -> dict:
         """Fill every visible field for `gear_name` with its default value.
 
-        Returns the dict of {field: value} pairs that were actually applied.
-        Fields skipped because of TimeoutException are absent from the dict —
-        useful for debugging when a field selector doesn't match the live page.
+        Raises if a required field is missing from the page — silent skip was
+        the original bug that caused empty-form submissions and timed-out
+        downloads.
         """
         applied: dict = {}
         for field in _GEAR_FIELDS.get(gear_name, []):
             if field not in DXF_DEFAULT_PARAMETERS:
                 continue
-            try:
-                self.set_parameter(field, DXF_DEFAULT_PARAMETERS[field])
-                applied[field] = DXF_DEFAULT_PARAMETERS[field]
-            except TimeoutException:
-                # Field was not rendered for this gear — skip rather than crash.
-                # This can happen legitimately if the refactor changed a field name;
-                # the test will still run and may surface a download failure.
-                pass
+            self.set_parameter(field, DXF_DEFAULT_PARAMETERS[field])
+            applied[field] = DXF_DEFAULT_PARAMETERS[field]
         return applied
 
     # ----- Download -----
 
     def click_download(self) -> None:
         """Click the Download button (does not wait for the file to arrive)."""
-        self.click(self.DOWNLOAD_BUTTON)
+        # click_visible handles the <button>/<a> duplicate render — see locator note.
+        self.click_visible(self.DOWNLOAD_BUTTON)
 
     def download_gear(self, downloads_dir: Path) -> Path:
         """Click Download and block until a .dxf file appears in downloads_dir.

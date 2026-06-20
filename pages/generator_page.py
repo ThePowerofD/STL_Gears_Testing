@@ -16,7 +16,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import (
+    ElementClickInterceptedException,
+    TimeoutException,
+)
 from selenium.webdriver.common.by import By
 
 from .base_page import BasePage
@@ -52,6 +55,25 @@ GEAR_TYPES = [
     "90° Bevel Gears",
 ]
 
+# Maps human-readable parameter labels to the real HTML name= attribute used
+# by the live STL generator. Discovered by inspecting the rendered DOM — the
+# page does not use accessible <label for="…"> markup, so text-proximity XPath
+# is unreliable. Update this map (not test code) if the dev renames a field.
+_STL_FIELD_NAMES: dict[str, str] = {
+    "Module":                 "modulo",
+    "Pressure Angle":         "ap",
+    "Number of Teeth":        "z",
+    "Gear Length":            "height",
+    "Profile Shift":          "x",
+    "Helix Angle":            "ah",
+    "Outer Diameter":         "outDiam",
+    "Rack Height":            "height",
+    "Rack Width":             "width",
+    "Rack Length":            "RackL",
+    "Wheel Number of Teeth":  "z",
+    "Pinion Number of Teeth": "z2",
+}
+
 
 class GeneratorPage(BasePage):
     URL_PATH = "/generators/3dprint"
@@ -72,26 +94,30 @@ class GeneratorPage(BasePage):
             f"//*[contains(normalize-space(),'{name}')]/following::*[contains(normalize-space(),'Start')][1]",
         )
     )
-    DOWNLOAD_BUTTON = (By.XPATH, "//*[contains(normalize-space(), 'Download Gear') "
-                                 "or contains(normalize-space(), 'Download Rack')]")
-
-    # Parameter inputs — text-label-based until test IDs are available
-    @staticmethod
-    def _input_near_label(label: str):
-        # Finds the first <input> whose label or preceding text matches `label`
-        return (
-            By.XPATH,
-            f"(//*[contains(normalize-space(), '{label}')]"
-            f"/following::input[not(@type='hidden')])[1]",
-        )
+    # Download button: the page renders BOTH a <button> and an <a> with the
+    # same "Download Gear" / "Download Rack" text — we restrict to interactive
+    # tags and resolve the visible one via click_visible().
+    DOWNLOAD_BUTTON = (
+        By.XPATH,
+        "//*[self::button or self::a or self::input[@type='button' or @type='submit']]"
+        "[contains(normalize-space(), 'Download Gear')"
+        " or contains(normalize-space(), 'Download Rack')]",
+    )
 
     @staticmethod
-    def _hole_type_option(value: str):
+    def _hole_type_radio(hole_type: str):
+        """Locator for the clickable hole-type control.
+
+        The hole-type UI uses styled <label class="groupbutton"> elements as
+        buttons — the underlying radio input is display:none and never
+        clickable directly. Bevel exposes two such groups (wheel + pinion),
+        each with its own copy of every label; select_hole_type() clicks
+        every visible match so both groups get set in one call.
+        """
         return (
             By.XPATH,
-            f"//label[contains(normalize-space(), '{value}')]"
-            f" | //input[@value='{value}']"
-            f" | //*[normalize-space()='{value}' and (self::button or self::span)]",
+            f"//label[contains(@class, 'groupbutton')]"
+            f"[normalize-space()='{hole_type}']",
         )
 
     # ----- Actions -----
@@ -107,10 +133,23 @@ class GeneratorPage(BasePage):
             raise ValueError(f"Unknown gear: {gear_name!r}. Known: {GEAR_TYPES}")
         self.click(self.START_BUTTON_FOR(gear_name))
 
+    @staticmethod
+    def _name_for(label: str) -> str:
+        try:
+            return _STL_FIELD_NAMES[label]
+        except KeyError as exc:
+            raise KeyError(
+                f"No name= mapping for parameter {label!r}. "
+                f"Add it to _STL_FIELD_NAMES in pages/generator_page.py."
+            ) from exc
+
+    def _input_locator(self, label: str):
+        """Locator for the (possibly duplicated) <input name='…'> for `label`."""
+        return (By.XPATH, f"//input[@name='{self._name_for(label)}']")
+
     def set_parameter(self, label: str, value) -> None:
         """Type `value` into the field labeled `label`. Number-input safe."""
-        loc = self._input_near_label(label)
-        self.set_number_input(loc, value)
+        self.set_input_by_name(self._name_for(label), value)
 
     def set_parameter_raw(self, label: str, value: str) -> None:
         """Force an arbitrary string into a labeled field via JavaScript.
@@ -120,15 +159,21 @@ class GeneratorPage(BasePage):
         application handles XSS payloads or scientific notation ('1e2') that the
         browser might silently discard before the value even reaches the DOM.
         """
-        self.set_raw_text(self._input_near_label(label), value)
+        # Resolve to the visible input (same gear-section scoping logic as
+        # set_input_by_name) before set_raw_text rewrites its value via JS.
+        el = self.find_first_visible(self._input_locator(label))
+        self.driver.execute_script(
+            "arguments[0].value = arguments[1];"
+            "arguments[0].dispatchEvent(new Event('input',  {bubbles: true}));"
+            "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));",
+            el,
+            str(value),
+        )
 
     def get_parameter_value(self, label: str) -> str:
-        """Return the current string value of the field labeled `label`.
-
-        Handy for asserting that the browser filtered out illegal characters
-        (e.g. typing 'abc' into a number field should leave the field empty).
-        """
-        return self.get_input_value(self._input_near_label(label))
+        """Return the current string value of the field labeled `label`."""
+        el = self.find_first_visible(self._input_locator(label))
+        return el.get_attribute("value") or ""
 
     def fill_default_parameters(self, gear_name: str) -> dict:
         """Set a sensible default for every visible field for this gear.
@@ -158,27 +203,79 @@ class GeneratorPage(BasePage):
                 fields += helical_extra
 
         for f in fields:
-            if f in DEFAULT_PARAMETERS:
-                try:
-                    self.set_parameter(f, DEFAULT_PARAMETERS[f])
-                    applied[f] = DEFAULT_PARAMETERS[f]
-                except TimeoutException:
-                    # Field may not be present for this gear; skip silently
-                    pass
+            if f not in DEFAULT_PARAMETERS:
+                continue
+            # Deliberately no try/except: if a field this gear claims to need
+            # is not visible, that is a real failure (form didn't open, the
+            # site renamed it, etc.). Silently swallowing it previously caused
+            # the form to submit empty and the Download to time out — a much
+            # worse failure mode than a clear error here.
+            self.set_parameter(f, DEFAULT_PARAMETERS[f])
+            applied[f] = DEFAULT_PARAMETERS[f]
         return applied
 
     def select_hole_type(self, hole_type: str) -> None:
+        """Select the named hole type on whichever hole-type group(s) are
+        visible on the current form.
+
+        Why click EVERY visible match: the Bevel form exposes both
+        wheel_hole_type and pinion_hole_type radio groups; if we only set one,
+        the form is incomplete and the download silently never happens.
+        Single-group gears (Spur, Helical, Bevel sub-cases) just see one
+        match and behave as before.
+        """
         if hole_type not in HOLE_TYPES:
             raise ValueError(f"Unknown hole type: {hole_type!r}")
-        self.click(self._hole_type_option(hole_type))
+        locator = self._hole_type_radio(hole_type)
+        matches = [el for el in self.driver.find_elements(*locator)
+                   if el.is_displayed()]
+        if not matches:
+            raise TimeoutException(
+                f"No visible hole-type radio for {hole_type!r}"
+            )
+        for el in matches:
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});", el
+            )
+            try:
+                el.click()
+            except ElementClickInterceptedException:
+                # Some radios are wrapped in styled labels that intercept;
+                # JS click bypasses the overlay.
+                self.driver.execute_script("arguments[0].click();", el)
 
     def click_download(self) -> None:
-        self.click(self.DOWNLOAD_BUTTON)
+        # click_visible (not click): the page renders two copies of the
+        # Download button, only one of which is actually interactive at a time.
+        self.click_visible(self.DOWNLOAD_BUTTON)
 
     def download_gear(self, downloads_dir: Path) -> Path:
-        """Click Download Gear and wait until an .stl file lands in downloads_dir."""
+        """Click Download Gear and return the path to an .stl file.
+
+        Most gear types deliver a plain .stl. The Bevel Gear page produces a
+        PAIR (wheel + pinion) bundled as a .zip — confirmed against the live
+        site, which names it e.g. `StraightBevelPair_M2_Pa20_Zw30_Zp10.zip`.
+        For tests that just need any valid STL we extract the first .stl
+        member of the archive and return its path. Tests that need to assert
+        on the zip contents directly can call click_download() + wait_for_download
+        themselves with extensions=('.zip',).
+        """
         self.click_download()
-        return self.wait_for_download(downloads_dir, extensions=(".stl",))
+        file_path = self.wait_for_download(
+            downloads_dir, extensions=(".stl", ".zip")
+        )
+        if file_path.suffix.lower() != ".zip":
+            return file_path
+
+        import zipfile
+        with zipfile.ZipFile(file_path) as zf:
+            stl_members = [m for m in zf.namelist() if m.lower().endswith(".stl")]
+            if not stl_members:
+                raise RuntimeError(
+                    f"Downloaded archive {file_path.name} contains no .stl"
+                )
+            zf.extract(stl_members[0], path=downloads_dir)
+        return downloads_dir / stl_members[0]
 
     # ----- Convenience composite -----
     def smoke_download(self, gear_name: str, downloads_dir: Path,

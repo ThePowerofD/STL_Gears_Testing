@@ -34,11 +34,14 @@ class HomePage(BasePage):
         return self
 
     def click_try_3dprint(self) -> None:
-        # 'Try it out' under STL section — closest link to the STL section heading
-        self.click(self.LINK_3DPRINT)
+        # 'Try it out' under STL section — the href matches several anchors
+        # on the page (navbar + hero CTA + section CTA + footer), some of which
+        # may be off-screen or hidden behind a responsive menu. click_visible
+        # picks whichever copy is currently displayed.
+        self.click_visible(self.LINK_3DPRINT)
 
     def click_try_lasercut(self) -> None:
-        self.click(self.LINK_LASERCUT)
+        self.click_visible(self.LINK_LASERCUT)
 
     def dismiss_banner_if_present(self) -> bool:
         if self.is_present(self.BANNER_CLOSE, timeout=2):

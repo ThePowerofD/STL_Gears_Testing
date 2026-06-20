@@ -76,6 +76,83 @@ class BasePage:
                     raise
                 time.sleep(0.3)
 
+    def find_first_visible(self, locator: Locator,
+                           timeout: int = DEFAULT_TIMEOUT) -> WebElement:
+        """Return the first matching element that is currently displayed.
+
+        Why: locators on this site frequently match multiple elements where
+        only one is visible — e.g. each gear type has its own form section
+        rendered with display:none, and the Download button renders as both
+        a <button> and an <a> sibling. EC.element_to_be_clickable only tests
+        the first match it finds, so a hidden duplicate causes it to time out
+        even though a clickable copy exists. This helper scans matches until
+        it finds one is_displayed() returns True for.
+        """
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                for el in self.driver.find_elements(*locator):
+                    if el.is_displayed():
+                        return el
+            except StaleElementReferenceException:
+                pass
+            time.sleep(0.2)
+        raise TimeoutException(
+            f"No visible element matched {locator} within {timeout}s"
+        )
+
+    def click_visible(self, locator: Locator,
+                      timeout: int = DEFAULT_TIMEOUT) -> None:
+        """Click the first VISIBLE element matching locator.
+
+        Use this instead of click() when a locator may match hidden duplicates
+        (Download buttons, gear-section inputs). Falls back to a JS click if
+        the native click is intercepted twice.
+        """
+        for attempt in (1, 2, 3):
+            try:
+                el = self.find_first_visible(locator, timeout=timeout)
+                self.driver.execute_script(
+                    "arguments[0].scrollIntoView({block: 'center'});", el
+                )
+                if attempt < 3:
+                    el.click()
+                else:
+                    self.driver.execute_script("arguments[0].click();", el)
+                return
+            except (ElementClickInterceptedException, StaleElementReferenceException):
+                if attempt == 3:
+                    raise
+                time.sleep(0.3)
+
+    def set_input_by_name(self, name: str, value) -> None:
+        """Fill the first VISIBLE <input name='…'> with `value`.
+
+        Why this rather than text-proximity XPath: the gear pages render all
+        gear-type forms in the same DOM (display:none for inactive ones), so
+        an input name like 'modulo' or 'z' appears multiple times. is_displayed()
+        is the only reliable way to pick the input that belongs to the
+        currently-open form.
+
+        The JS pre-clear + dispatchEvent('input'/'change') pattern is required
+        because the page uses framework-bound number inputs that ignore native
+        clear() and won't recalculate previews unless 'change' fires.
+        """
+        el = self.find_first_visible((By.XPATH, f"//input[@name='{name}']"))
+        self.driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center'});"
+            "arguments[0].focus();"
+            "arguments[0].value = '';"
+            "arguments[0].dispatchEvent(new Event('input', {bubbles: true}));",
+            el,
+        )
+        el.send_keys(str(value))
+        self.driver.execute_script(
+            "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));"
+            "arguments[0].blur();",
+            el,
+        )
+
     def type_into(self, locator: Locator, value: str | int | float,
                   clear: bool = True, timeout: int = DEFAULT_TIMEOUT) -> None:
         el = self.find_visible(locator, timeout=timeout)
