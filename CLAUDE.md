@@ -57,7 +57,6 @@ Page Object Model. Layers:
 
 - `driver.get_log("browser")` is **Chrome-only**. Firefox's GeckoDriver raises `WebDriverException`. Tests that need console logs should `pytest.skip(...)` on that exception, not fail.
 - Default download timeout is 30 s (`base_page.DOWNLOAD_TIMEOUT`); negative tests use 8 s explicitly because we *want* a fast failure when nothing should arrive.
-- The empty `selenium-tests/` and `selenium-tests-stlgears/` directories at the project root are leftover scaffold and can be deleted; nothing imports from them.
 - `dismiss_banner_if_present()` lives on `BasePage` so both generators inherit it.
 
 ## Adding a new test
